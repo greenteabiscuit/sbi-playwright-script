@@ -1,0 +1,12 @@
+{
+  "name": "sbi-automation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node sbi-2026-downloader.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.54.2"
+  }
+}
