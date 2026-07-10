@@ -4,6 +4,7 @@ profile/
 # Downloaded brokerage records and generated audit artifacts.
 downloads/
 snapshots/
+analysis-output/
 
 # Dependencies and local tooling.
 node_modules/
