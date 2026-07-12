@@ -29,6 +29,18 @@ SBI_DOWNLOAD_VISIBLE=1 \
 npm start
 ```
 
+Download records exposed by SBI's legacy viewer:
+
+```bash
+SBI_INSPECT_ONLY=1 \
+SBI_VIEWER=1 \
+SBI_LEGACY=1 \
+SBI_LEGACY_DOWNLOAD_VISIBLE=1 \
+SBI_FROM_YEAR=2018 \
+SBI_TO_YEAR=2026 \
+npm start
+```
+
 ## Output
 
 Downloaded PDFs are written under `downloads/`, with a JSONL manifest under `downloads/`.

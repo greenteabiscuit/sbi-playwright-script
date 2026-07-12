@@ -199,6 +199,19 @@ async function openReportViewerFromPortal(page) {
   return viewer;
 }
 
+async function openLegacyViewerFromCurrent(page) {
+  console.log("Opening legacy report viewer from the current viewer link...");
+  const legacyLink = page.locator("a[href*='deisw070.jsp'], a:has-text('2022年4月22日以前')").first();
+  await legacyLink.scrollIntoViewIfNeeded({ timeout: 15000 });
+  const popupPromise = page.waitForEvent("popup", { timeout: 15000 }).catch(() => null);
+  await legacyLink.click({ timeout: 10000, force: true });
+  const popup = await popupPromise;
+  const legacy = popup || page;
+  await legacy.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+  await legacy.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+  return legacy;
+}
+
 async function expandFirstReportItem(page) {
   const firstHeader = page.locator("mat-expansion-panel.item mat-expansion-panel-header.item__header").first();
   await firstHeader.scrollIntoViewIfNeeded({ timeout: 10000 });
@@ -331,6 +344,22 @@ async function saveBlobPopup(popup, metadata) {
   });
   await savePdfBytes(bytes, { ...metadata, popupUrl: popup.url() }, "blob-popup");
   await popup.close().catch(() => {});
+}
+
+async function savePdfFromPageUrl(page, metadata, sourceKind) {
+  const result = await page.evaluate(async () => {
+    const response = await fetch(location.href);
+    const buffer = await response.arrayBuffer();
+    const bytes = Array.from(new Uint8Array(buffer));
+    const header = String.fromCharCode(...bytes.slice(0, 4));
+    return {
+      ok: header === "%PDF",
+      bytes
+    };
+  });
+  if (!result.ok) return false;
+  await savePdfBytes(result.bytes, { ...metadata, popupUrl: page.url() }, sourceKind);
+  return true;
 }
 
 async function clickFirstPdfButton(page) {
@@ -477,6 +506,127 @@ async function downloadPdfButton(page, panel, button, metadata) {
   return false;
 }
 
+async function collectLegacyReports(page) {
+  return page.evaluate(() => {
+    const clean = value => String(value || "").replace(/\s+/g, " ").trim();
+    const html = document.body.innerHTML;
+    const chunks = html.split(/<li[^>]+class=["'][^"']*message[^"']*["'][^>]*>/i).slice(1);
+    return chunks.map((chunk, index) => {
+      const beforeEnd = chunk.split(/<\/li>/i)[0] || chunk;
+      const textFromClass = className => {
+        const match = beforeEnd.match(new RegExp(`<[^>]+class=["'][^"']*${className}[^"']*["'][^>]*>([\\s\\S]*?)<\\/[^>]+>`, "i"));
+        if (!match) return "";
+        const div = document.createElement("div");
+        div.innerHTML = match[1];
+        return clean(div.textContent);
+      };
+      const onclick = beforeEnd.match(/doInline\([^)]*'([0-9]+)'[^)]*\)/i)?.[0] || "";
+      const messageNo = onclick.match(/'([0-9]+)'/)?.[1] || "";
+      const titleMatch = beforeEnd.match(/<div[^>]+class=["'][^"']*title[^"']*["'][^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
+      const div = document.createElement("div");
+      div.innerHTML = titleMatch?.[1] || "";
+      return {
+        index,
+        messageNo,
+        date: textFromClass("date"),
+        type: textFromClass("type"),
+        text: clean(div.textContent),
+        displayText: beforeEnd.includes("doInline") ? "表示" : ""
+      };
+    }).filter(item => item.messageNo && item.date && item.type);
+  });
+}
+
+async function downloadLegacyVisibleReports(page) {
+  const downloadedKeys = await loadDownloadedKeys();
+  let saved = 0;
+  let skipped = 0;
+  const maxPages = Number(process.env.SBI_LEGACY_MAX_PAGES || "50");
+
+  for (let pageIndex = 1; pageIndex <= maxPages; pageIndex += 1) {
+    const reports = await collectLegacyReports(page);
+    console.log(`Visible legacy-report rows on page ${pageIndex}: ${reports.length}`);
+    if (reports.length === 0) break;
+
+    for (let i = 0; i < reports.length; i += 1) {
+      const report = reports[i];
+      const metadata = {
+        sourceUrl: page.url(),
+        index: report.index,
+        date: report.date,
+        type: report.type,
+        text: report.text,
+        pdfIndex: 0,
+        pdfText: report.messageNo,
+        legacyMessageNo: report.messageNo
+      };
+      if (downloadedKeys.has(baseReportKey(metadata)) || downloadedKeys.has(reportKey(metadata))) {
+        skipped += 1;
+        continue;
+      }
+
+      const downloadPromise = page.waitForEvent("download", { timeout: 15000 })
+        .then(download => ({ kind: "download", download }))
+        .catch(() => null);
+      const popupPromise = page.waitForEvent("popup", { timeout: 15000 })
+        .then(popup => ({ kind: "popup", popup }))
+        .catch(() => null);
+      const navigationPromise = page.waitForURL(url => String(url).includes("DocumentTextDisplayAction"), { timeout: 15000 })
+        .then(() => ({ kind: "navigation" }))
+        .catch(() => null);
+
+      await page.evaluate(messageNo => {
+        if (typeof window.clearProcess === "function") window.clearProcess();
+        window.doInline("/web/DocumentTextDisplayAction.do", messageNo, document.f_sub06);
+      }, report.messageNo);
+      const event = await Promise.race([downloadPromise, popupPromise, navigationPromise]);
+
+      let ok = false;
+      if (event?.kind === "download") {
+        await saveDownload(event.download, metadata);
+        ok = true;
+      } else if (event?.kind === "popup") {
+        await event.popup.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+        ok = await savePdfFromPageUrl(event.popup, metadata, "legacy-popup").catch(() => false);
+        await event.popup.close().catch(() => {});
+      } else {
+        await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+        await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+        ok = await savePdfFromPageUrl(page, metadata, "legacy-inline").catch(() => false);
+      }
+      if (page.url() !== metadata.sourceUrl) {
+        await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+        await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+      }
+
+      if (ok) {
+        downloadedKeys.add(reportKey(metadata));
+        downloadedKeys.add(baseReportKey(metadata));
+        saved += 1;
+      } else {
+        console.log(`No legacy PDF event for ${metadata.date} ${metadata.type} ${metadata.text}`);
+        skipped += 1;
+      }
+      await page.waitForTimeout(2200);
+    }
+
+    const hasNext = await page.locator("a[title='次のページへ']").count().then(count => count > 0).catch(() => false);
+    if (!hasNext) break;
+    const nextPage = String(pageIndex + 1);
+    const pagePromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+    await page.evaluate(nextPage => {
+      if (typeof window.clearProcess === "function") window.clearProcess();
+      window.goChangePage(nextPage, document.f_subpage);
+    }, nextPage);
+    await pagePromise;
+    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(2200);
+  }
+
+  console.log(`Saved ${saved} legacy PDF(s), skipped ${skipped}.`);
+  return saved;
+}
+
 async function downloadVisibleCurrentReports(page) {
   const downloadedKeys = await loadDownloadedKeys();
   const panels = page.locator("mat-expansion-panel.item");
@@ -581,6 +731,10 @@ async function main() {
     page = await openReportViewerFromPortal(page);
   }
 
+  if (process.env.SBI_LEGACY === "1") {
+    page = await openLegacyViewerFromCurrent(page);
+  }
+
   if (process.env.SBI_EXPAND_FIRST === "1") {
     await expandFirstReportItem(page);
   }
@@ -596,6 +750,10 @@ async function main() {
 
   if (process.env.SBI_TEST_DOWNLOAD_FIRST === "1") {
     await clickFirstPdfButton(page);
+  }
+
+  if (process.env.SBI_LEGACY_DOWNLOAD_VISIBLE === "1") {
+    await downloadLegacyVisibleReports(page);
   }
 
   if (process.env.SBI_DOWNLOAD_VISIBLE === "1") {
